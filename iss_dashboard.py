@@ -17,6 +17,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 
 # -----------------------------------------------------------------------------
 # Page configuration
@@ -486,47 +491,154 @@ def plot_peer_table(peers: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
+# Ticker data helpers
+# -----------------------------------------------------------------------------
+def calculate_period_return(price_history: pd.DataFrame, years: int) -> float | None:
+    """Return total return over an approximate lookback window using adjusted prices."""
+    if price_history is None or price_history.empty or "Close" not in price_history.columns:
+        return None
+
+    hist = price_history.dropna(subset=["Close"]).copy()
+    if hist.empty:
+        return None
+
+    latest_date = hist.index.max()
+    start_cutoff = latest_date - pd.DateOffset(years=years)
+    start_window = hist[hist.index >= start_cutoff]
+    if len(start_window) < 2:
+        return None
+
+    start_price = float(start_window["Close"].iloc[0])
+    end_price = float(start_window["Close"].iloc[-1])
+    if start_price <= 0:
+        return None
+    return (end_price / start_price) - 1.0
+
+
+@st.cache_data(ttl=60 * 60)
+def load_market_data(ticker: str) -> Dict[str, object]:
+    """Pull basic market and financial data from Yahoo Finance via yfinance."""
+    if yf is None:
+        raise RuntimeError("yfinance is not installed. Add yfinance to requirements.txt and reboot the app.")
+
+    clean_ticker = ticker.strip().upper()
+    if not clean_ticker:
+        raise ValueError("Enter a ticker symbol.")
+
+    yft = yf.Ticker(clean_ticker)
+    hist = yft.history(period="5y", auto_adjust=True)
+    if hist is None or hist.empty:
+        raise ValueError(f"No price history found for {clean_ticker}.")
+
+    try:
+        info = yft.get_info()
+    except Exception:
+        info = {}
+
+    company_name = info.get("longName") or info.get("shortName") or clean_ticker
+
+    result: Dict[str, object] = {
+        "company_name": company_name,
+        "ticker": clean_ticker,
+        "tsr_1yr": calculate_period_return(hist, 1),
+        "tsr_3yr": calculate_period_return(hist, 3),
+        "tsr_5yr": calculate_period_return(hist, 5),
+        "market_cap": info.get("marketCap"),
+        "trailing_eps": info.get("trailingEps"),
+    }
+
+    # Financial statement fields are best-efforts only. Availability varies by company.
+    try:
+        fin = yft.financials
+        if fin is not None and not fin.empty:
+            if "Total Revenue" in fin.index and len(fin.loc["Total Revenue"].dropna()) >= 2:
+                rev = fin.loc["Total Revenue"].dropna().astype(float)
+                latest_rev = float(rev.iloc[0])
+                prior_rev = float(rev.iloc[1])
+                if prior_rev != 0:
+                    result["revenue_growth"] = (latest_rev / prior_rev) - 1.0
+            if "EBITDA" in fin.index and "Total Revenue" in fin.index:
+                ebitda = fin.loc["EBITDA"].dropna().astype(float)
+                revenue = fin.loc["Total Revenue"].dropna().astype(float)
+                if len(ebitda) > 0 and len(revenue) > 0 and float(revenue.iloc[0]) != 0:
+                    result["ebitda_margin"] = float(ebitda.iloc[0]) / float(revenue.iloc[0])
+    except Exception:
+        pass
+
+    return result
+
+
+def get_state_default(key: str, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.session_state[key]
+
+
+# -----------------------------------------------------------------------------
 # Sidebar
 # -----------------------------------------------------------------------------
 def build_sidebar() -> Tuple[CompanyData, pd.DataFrame]:
-    st.sidebar.header("Company Information")
     c = CompanyData()
-    c.company_name = st.sidebar.text_input("Company Name", c.company_name)
-    c.ticker = st.sidebar.text_input("Ticker Symbol", c.ticker)
-    c.fiscal_year = st.sidebar.number_input("Fiscal Year", min_value=2020, max_value=2030, value=c.fiscal_year, step=1)
+
+    st.sidebar.header("Load Company by Ticker")
+    lookup_ticker = st.sidebar.text_input("Ticker lookup", value=st.session_state.get("lookup_ticker", c.ticker), key="lookup_ticker")
+    if st.sidebar.button("Load Market Data"):
+        try:
+            data = load_market_data(lookup_ticker)
+            st.session_state["company_name_input"] = str(data.get("company_name") or lookup_ticker.upper())
+            st.session_state["ticker_input"] = str(data.get("ticker") or lookup_ticker.upper())
+
+            for field in ["tsr_1yr", "tsr_3yr", "tsr_5yr", "revenue_growth", "ebitda_margin"]:
+                value = data.get(field)
+                if value is not None and not pd.isna(value):
+                    st.session_state[f"{field}_input"] = float(np.clip(value, -2.0, 3.0))
+
+            st.sidebar.success(f"Loaded market data for {st.session_state['ticker_input']}.")
+            if data.get("market_cap"):
+                st.sidebar.caption(f"Market cap: {format_money(float(data['market_cap']))}")
+        except Exception as exc:
+            st.sidebar.error(f"Could not load ticker data: {exc}")
+
+    st.sidebar.caption("Market data is pulled from Yahoo Finance. CEO pay and governance fields still need to be entered from the proxy or your analysis.")
+
+    st.sidebar.header("Company Information")
+    c.company_name = st.sidebar.text_input("Company Name", value=get_state_default("company_name_input", c.company_name), key="company_name_input")
+    c.ticker = st.sidebar.text_input("Ticker Symbol", value=get_state_default("ticker_input", c.ticker), key="ticker_input")
+    c.fiscal_year = st.sidebar.number_input("Fiscal Year", min_value=2020, max_value=2030, value=int(get_state_default("fiscal_year_input", c.fiscal_year)), step=1, key="fiscal_year_input")
 
     st.sidebar.header("CEO Compensation")
-    c.ceo_base_salary = st.sidebar.number_input("Base Salary ($)", min_value=0, value=int(c.ceo_base_salary), step=50_000)
-    c.ceo_annual_bonus = st.sidebar.number_input("Annual Bonus ($)", min_value=0, value=int(c.ceo_annual_bonus), step=50_000)
-    c.ceo_stock_awards = st.sidebar.number_input("Stock Awards ($)", min_value=0, value=int(c.ceo_stock_awards), step=250_000)
-    c.ceo_option_awards = st.sidebar.number_input("Option Awards ($)", min_value=0, value=int(c.ceo_option_awards), step=250_000)
-    c.ceo_other_comp = st.sidebar.number_input("Other Compensation ($)", min_value=0, value=int(c.ceo_other_comp), step=10_000)
+    c.ceo_base_salary = st.sidebar.number_input("Base Salary ($)", min_value=0, value=int(get_state_default("base_salary_input", c.ceo_base_salary)), step=50_000, key="base_salary_input")
+    c.ceo_annual_bonus = st.sidebar.number_input("Annual Bonus ($)", min_value=0, value=int(get_state_default("annual_bonus_input", c.ceo_annual_bonus)), step=50_000, key="annual_bonus_input")
+    c.ceo_stock_awards = st.sidebar.number_input("Stock Awards ($)", min_value=0, value=int(get_state_default("stock_awards_input", c.ceo_stock_awards)), step=250_000, key="stock_awards_input")
+    c.ceo_option_awards = st.sidebar.number_input("Option Awards ($)", min_value=0, value=int(get_state_default("option_awards_input", c.ceo_option_awards)), step=250_000, key="option_awards_input")
+    c.ceo_other_comp = st.sidebar.number_input("Other Compensation ($)", min_value=0, value=int(get_state_default("other_comp_input", c.ceo_other_comp)), step=10_000, key="other_comp_input")
 
     st.sidebar.header("Performance Data")
-    c.tsr_1yr = st.sidebar.slider("1-Year TSR", -0.50, 1.00, c.tsr_1yr, 0.01, format="%.0f%%")
-    c.tsr_3yr = st.sidebar.slider("3-Year TSR", -0.50, 1.50, c.tsr_3yr, 0.01, format="%.0f%%")
-    c.tsr_5yr = st.sidebar.slider("5-Year TSR", -0.50, 2.00, c.tsr_5yr, 0.01, format="%.0f%%")
-    c.revenue_growth = st.sidebar.slider("Revenue Growth", -0.30, 0.60, c.revenue_growth, 0.01, format="%.0f%%")
-    c.eps_growth = st.sidebar.slider("EPS Growth", -0.50, 1.00, c.eps_growth, 0.01, format="%.0f%%")
-    c.roic = st.sidebar.slider("ROIC", -0.20, 0.50, c.roic, 0.01, format="%.0f%%")
+    c.tsr_1yr = st.sidebar.slider("1-Year TSR", -0.50, 1.00, float(get_state_default("tsr_1yr_input", c.tsr_1yr)), 0.01, format="%.0f%%", key="tsr_1yr_input")
+    c.tsr_3yr = st.sidebar.slider("3-Year TSR", -0.50, 1.50, float(get_state_default("tsr_3yr_input", c.tsr_3yr)), 0.01, format="%.0f%%", key="tsr_3yr_input")
+    c.tsr_5yr = st.sidebar.slider("5-Year TSR", -0.50, 2.00, float(get_state_default("tsr_5yr_input", c.tsr_5yr)), 0.01, format="%.0f%%", key="tsr_5yr_input")
+    c.revenue_growth = st.sidebar.slider("Revenue Growth", -0.30, 0.60, float(get_state_default("revenue_growth_input", c.revenue_growth)), 0.01, format="%.0f%%", key="revenue_growth_input")
+    c.ebitda_margin = st.sidebar.slider("EBITDA Margin", -0.20, 0.60, float(get_state_default("ebitda_margin_input", c.ebitda_margin)), 0.01, format="%.0f%%", key="ebitda_margin_input")
+    c.eps_growth = st.sidebar.slider("EPS Growth", -0.50, 1.00, float(get_state_default("eps_growth_input", c.eps_growth)), 0.01, format="%.0f%%", key="eps_growth_input")
+    c.roic = st.sidebar.slider("ROIC", -0.20, 0.50, float(get_state_default("roic_input", c.roic)), 0.01, format="%.0f%%", key="roic_input")
 
     st.sidebar.header("Plan Features")
-    c.lti_performance_pct = st.sidebar.slider("LTI % Performance-Based", 0.0, 1.0, c.lti_performance_pct, 0.05, format="%.0f%%")
-    c.severance_multiple = st.sidebar.slider("Severance Multiple", 1.0, 5.0, c.severance_multiple, 0.25)
-    c.ownership_multiple = st.sidebar.slider("Stock Ownership Guideline", 0, 10, c.ownership_multiple)
-    c.prior_say_on_pay = st.sidebar.slider("Prior Year SOP Vote", 0.50, 1.00, c.prior_say_on_pay, 0.01, format="%.0f%%")
-    c.has_clawback = st.sidebar.checkbox("Clawback Policy", c.has_clawback)
-    c.has_stock_ownership = st.sidebar.checkbox("Stock Ownership Guidelines", c.has_stock_ownership)
-    c.has_relative_tsr = st.sidebar.checkbox("Relative TSR Metric", c.has_relative_tsr)
-    c.sti_has_caps = st.sidebar.checkbox("STI Plan Has Caps", c.sti_has_caps)
-    c.board_responsiveness = st.sidebar.checkbox("Board Responsiveness Demonstrated", c.board_responsiveness)
+    c.lti_performance_pct = st.sidebar.slider("LTI % Performance-Based", 0.0, 1.0, float(get_state_default("lti_performance_input", c.lti_performance_pct)), 0.05, format="%.0f%%", key="lti_performance_input")
+    c.severance_multiple = st.sidebar.slider("Severance Multiple", 1.0, 5.0, float(get_state_default("severance_multiple_input", c.severance_multiple)), 0.25, key="severance_multiple_input")
+    c.ownership_multiple = st.sidebar.slider("Stock Ownership Guideline", 0, 10, int(get_state_default("ownership_multiple_input", c.ownership_multiple)), key="ownership_multiple_input")
+    c.prior_say_on_pay = st.sidebar.slider("Prior Year SOP Vote", 0.50, 1.00, float(get_state_default("prior_say_on_pay_input", c.prior_say_on_pay)), 0.01, format="%.0f%%", key="prior_say_on_pay_input")
+    c.has_clawback = st.sidebar.checkbox("Clawback Policy", value=bool(get_state_default("has_clawback_input", c.has_clawback)), key="has_clawback_input")
+    c.has_stock_ownership = st.sidebar.checkbox("Stock Ownership Guidelines", value=bool(get_state_default("has_stock_ownership_input", c.has_stock_ownership)), key="has_stock_ownership_input")
+    c.has_relative_tsr = st.sidebar.checkbox("Relative TSR Metric", value=bool(get_state_default("has_relative_tsr_input", c.has_relative_tsr)), key="has_relative_tsr_input")
+    c.sti_has_caps = st.sidebar.checkbox("STI Plan Has Caps", value=bool(get_state_default("sti_has_caps_input", c.sti_has_caps)), key="sti_has_caps_input")
+    c.board_responsiveness = st.sidebar.checkbox("Board Responsiveness Demonstrated", value=bool(get_state_default("board_responsiveness_input", c.board_responsiveness)), key="board_responsiveness_input")
 
     st.sidebar.header("Governance Flags")
-    c.has_single_trigger = st.sidebar.checkbox("Single-Trigger CIC Vesting", c.has_single_trigger)
-    c.has_excise_tax_gross_up = st.sidebar.checkbox("Excise Tax Gross-Up", c.has_excise_tax_gross_up)
-    c.midcycle_grant = st.sidebar.checkbox("Mid-Cycle / Special Grant", c.midcycle_grant)
-    c.repricing_history = st.sidebar.checkbox("Option Repricing History", c.repricing_history)
-    c.metric_changes = st.sidebar.checkbox("Metric Changes", c.metric_changes)
+    c.has_single_trigger = st.sidebar.checkbox("Single-Trigger CIC Vesting", value=bool(get_state_default("has_single_trigger_input", c.has_single_trigger)), key="has_single_trigger_input")
+    c.has_excise_tax_gross_up = st.sidebar.checkbox("Excise Tax Gross-Up", value=bool(get_state_default("has_excise_tax_gross_up_input", c.has_excise_tax_gross_up)), key="has_excise_tax_gross_up_input")
+    c.midcycle_grant = st.sidebar.checkbox("Mid-Cycle / Special Grant", value=bool(get_state_default("midcycle_grant_input", c.midcycle_grant)), key="midcycle_grant_input")
+    c.repricing_history = st.sidebar.checkbox("Option Repricing History", value=bool(get_state_default("repricing_history_input", c.repricing_history)), key="repricing_history_input")
+    c.metric_changes = st.sidebar.checkbox("Metric Changes", value=bool(get_state_default("metric_changes_input", c.metric_changes)), key="metric_changes_input")
 
     st.sidebar.header("Peer Group")
     uploaded = st.sidebar.file_uploader("Upload peer CSV", type=["csv"])
@@ -538,7 +650,7 @@ def build_sidebar() -> Tuple[CompanyData, pd.DataFrame]:
             st.sidebar.error(str(exc))
             peers = generate_peer_data()
     else:
-        n_peers = st.sidebar.slider("Sample peer count", 8, 20, 15)
+        n_peers = st.sidebar.slider("Sample peer count", 8, 20, 15, key="sample_peer_count_input")
         peers = generate_peer_data(n_peers=n_peers)
 
     return c, peers
