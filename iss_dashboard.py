@@ -589,10 +589,22 @@ def main() -> None:
     with tab1:
         left, right = st.columns([1.3, 1])
         with left:
-            st.plotly_chart(plot_pay_vs_tsr(company, peers, scorer), use_container_width=True)
+            st.plotly_chart(
+                plot_pay_vs_tsr(company, peers, scorer),
+                use_container_width=True,
+                key="overview_pay_vs_tsr_chart",
+            )
         with right:
-            st.plotly_chart(plot_vote_gauge(predicted_vote), use_container_width=True)
-        st.plotly_chart(plot_pay_breakdown(company), use_container_width=True)
+            st.plotly_chart(
+                plot_vote_gauge(predicted_vote),
+                use_container_width=True,
+                key="overview_vote_gauge_chart",
+            )
+        st.plotly_chart(
+            plot_pay_breakdown(company),
+            use_container_width=True,
+            key="overview_pay_breakdown_chart",
+        )
 
     with tab2:
         st.subheader("Quantitative Screen")
@@ -604,13 +616,21 @@ def main() -> None:
             ]
         )
         st.dataframe(quant_df, hide_index=True, use_container_width=True)
-        st.plotly_chart(plot_pay_vs_tsr(company, peers, scorer), use_container_width=True)
+        st.plotly_chart(
+            plot_pay_vs_tsr(company, peers, scorer),
+            use_container_width=True,
+            key="quant_pay_vs_tsr_chart",
+        )
 
     with tab3:
         qual_scores = scorer.qualitative_score()
         left, right = st.columns([1.2, 1])
         with left:
-            st.plotly_chart(plot_qualitative_radar(qual_scores), use_container_width=True)
+            st.plotly_chart(
+                plot_qualitative_radar(qual_scores),
+                use_container_width=True,
+                key="qualitative_radar_chart",
+            )
         with right:
             qdf = pd.DataFrame({"Factor": list(qual_scores.keys()), "Score": list(qual_scores.values())})
             qdf["Factor"] = qdf["Factor"].str.replace("_", " ").str.title()
